@@ -4,9 +4,15 @@ A clean, minimal system monitor for Windows. Everything is optional: turn featur
 
 ## Download
 
-Grab `SystemMonitor.exe` from the [Releases](../../releases) page and double-click it. No installation or Python needed.
+1. Go to the [Releases](../../releases) page and download `SystemMonitor-windows.zip`.
+2. Right-click the zip, choose **Extract All**, and open the extracted folder.
+3. Double-click `SystemMonitor.exe`. Keep it inside its folder, because it needs the files next to it.
 
-Windows may show a SmartScreen warning for unsigned apps: click **More info → Run anyway**.
+Windows SmartScreen may warn about unsigned apps: click **More info → Run anyway**. Some antivirus programs flag unsigned apps built with PyInstaller by mistake. The full source is in this repo, and the release includes a `.sha256` file so you can verify your download:
+
+```
+certutil -hashfile SystemMonitor-windows.zip SHA256
+```
 
 ## Features
 
