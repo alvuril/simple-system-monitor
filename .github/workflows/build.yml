@@ -1,29 +1,40 @@
-   name: Build Windows app
+name: Build Windows app
 
-   on:
-     push:
-       tags: ["v*"]
-     workflow_dispatch:
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
 
-   permissions:
-     contents: write
+permissions:
+  contents: write
 
-   jobs:
-     build:
-       runs-on: windows-latest
-       steps:
-         - uses: actions/checkout@v4
-         - uses: actions/setup-python@v5
-           with:
-             python-version: "3.12"
-         - run: pip install -r requirements.txt pyinstaller
-         - run: pyinstaller --noconfirm --onefile --windowed --name SystemMonitor sysmon.py
-         - uses: actions/upload-artifact@v4
-           with:
-             name: SystemMonitor
-             path: dist/SystemMonitor.exe
-         - name: Attach to GitHub Release
-           if: startsWith(github.ref, 'refs/tags/')
-           uses: softprops/action-gh-release@v2
-           with:
-             files: dist/SystemMonitor.exe
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - name: Build (folder build, no UPX, with version info)
+        run: pyinstaller --noconfirm --onedir --windowed --noupx --name SystemMonitor --version-file version_info.txt sysmon.py
+      - name: Zip and hash
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/SystemMonitor -DestinationPath SystemMonitor-windows.zip
+          $hash = (Get-FileHash SystemMonitor-windows.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  SystemMonitor-windows.zip" | Out-File -Encoding ascii SystemMonitor-windows.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SystemMonitor
+          path: |
+            SystemMonitor-windows.zip
+            SystemMonitor-windows.zip.sha256
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SystemMonitor-windows.zip
+            SystemMonitor-windows.zip.sha256
