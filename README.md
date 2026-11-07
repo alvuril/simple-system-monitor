@@ -21,7 +21,7 @@ certutil -hashfile SystemMonitor-windows.zip SHA256
 - Memory and swap / page file
 - Disk usage for any drive, plus disk read / write speed
 - Network download / upload speed (MB/s or Mbps) with optional graph
-- GPU load and video memory for NVIDIA, AMD and Intel (NVIDIA cards also show temperature)
+- GPU load and video memory for NVIDIA, AMD and Intel (only NVIDIA cards show temperature)
 - Battery level, charging state and time remaining
 - Uptime
 - Top processes by CPU or memory (type in how many to show)
