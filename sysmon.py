@@ -3,6 +3,7 @@ import csv
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,7 @@ try:  # crisp text on high-DPI screens
 except Exception:
     pass
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 FONT = "Segoe UI"
 W, SETTINGS_H, PAD = 360, 600, 28
 WARN, CRIT = "#f6c177", "#eb6f92"
@@ -72,7 +73,7 @@ ROWS = [
     ("Network speed", "show_net", TOGGLE, None),
     ("Network graph", "net_graph", TOGGLE, None),
     ("Network units", "net_units", CHOICE, [("MB/s", "MB/s"), ("Mbps", "Mbps")]),
-    ("GPU (NVIDIA)", "show_gpu", TOGGLE, None),
+    ("GPU", "show_gpu", TOGGLE, None),
     ("Temperature unit", "temp_unit", CHOICE, [("C", "°C"), ("F", "°F")]),
     ("Battery", "show_battery", TOGGLE, None),
     ("Uptime", "show_uptime", TOGGLE, None),
@@ -157,6 +158,161 @@ def read_gpu():
         return None
 
 
+# ---- GPU (any vendor) via Windows performance counters ------------------
+ENG_RE = re.compile(r"luid_(0x[0-9a-f]+_0x[0-9a-f]+)_phys_\d+_eng_\d+_engtype_(.+)$", re.I)
+MEM_RE = re.compile(r"luid_(0x[0-9a-f]+_0x[0-9a-f]+)", re.I)
+
+
+def summarize_gpu(engine, mem, total):
+    """Turn raw counter values into (load %, VRAM used MB, VRAM total MB or None, temp or None)."""
+    busy = {}
+    for name, val in engine.items():
+        m = ENG_RE.search(name)
+        if m:
+            key = (m.group(1).lower(), m.group(2).lower())
+            busy[key] = busy.get(key, 0.0) + val
+    util = {}
+    for (luid, _), v in busy.items():
+        util[luid] = max(util.get(luid, 0.0), v)
+    used = {}
+    for name, val in mem.items():
+        m = MEM_RE.search(name)
+        if m:
+            used[m.group(1).lower()] = val
+    if not util and not used:
+        return None
+    pool = used or util  # main GPU = the one holding the most video memory
+    main = max(pool, key=pool.get)
+    return (min(util.get(main, 0.0), 100.0), used.get(main, 0.0) / 1048576,
+            total / 1048576 if total else None, None)
+
+
+def vram_total():
+    """Total video memory if the PC has exactly one GPU entry in the registry."""
+    try:
+        import winreg
+        base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        sizes = []
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, i)
+                except OSError:
+                    break
+                i += 1
+                if not sub.isdigit():
+                    continue
+                try:
+                    with winreg.OpenKey(k, sub) as sk:
+                        val, _ = winreg.QueryValueEx(sk, "HardwareInformation.qwMemorySize")
+                    if isinstance(val, bytes):
+                        val = int.from_bytes(val[:8], "little")
+                    if val:
+                        sizes.append(int(val))
+                except OSError:
+                    pass
+        return sizes[0] if len(sizes) == 1 else None
+    except Exception:
+        return None
+
+
+class GpuCounters:
+    """Reads GPU load and VRAM for NVIDIA, AMD and Intel through the Windows PDH API."""
+    ENGINE = r"\GPU Engine(*)\Utilization Percentage"
+    MEMORY = r"\GPU Adapter Memory(*)\Dedicated Usage"
+    REOPEN_AFTER = 15  # reads; refreshes the list of GPU-using processes
+
+    def __init__(self):
+        self.ok = os.name == "nt"
+        self.query, self.handles, self.polls, self.last = None, {}, 0, None
+        self.total = vram_total() if self.ok else None
+
+    def _setup_api(self):
+        from ctypes import POINTER, c_uint32, c_void_p, c_wchar_p, c_size_t
+        pdh = ctypes.windll.pdh
+        pdh.PdhOpenQueryW.argtypes = [c_wchar_p, c_size_t, POINTER(c_void_p)]
+        pdh.PdhAddEnglishCounterW.argtypes = [c_void_p, c_wchar_p, c_size_t, POINTER(c_void_p)]
+        pdh.PdhCollectQueryData.argtypes = [c_void_p]
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [c_void_p, c_uint32, POINTER(c_uint32),
+                                                     POINTER(c_uint32), c_void_p]
+        pdh.PdhCloseQuery.argtypes = [c_void_p]
+        return pdh
+
+    def close(self):
+        if self.query is not None:
+            try:
+                ctypes.windll.pdh.PdhCloseQuery(self.query)
+            except Exception:
+                pass
+        self.query, self.handles = None, {}
+
+    def _open(self):
+        pdh = self._setup_api()
+        q = ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0:
+            raise OSError("PDH unavailable")
+        self.query = q
+        for name, path in (("engine", self.ENGINE), ("mem", self.MEMORY)):
+            h = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(q, path, 0, ctypes.byref(h)) == 0:
+                self.handles[name] = h
+        if "engine" not in self.handles:
+            raise OSError("no GPU counters on this Windows version")
+        pdh.PdhCollectQueryData(q)  # first sample; values appear from the next read
+
+    def _array(self, handle):
+        class Val(ctypes.Union):
+            _fields_ = [("longValue", ctypes.c_long), ("doubleValue", ctypes.c_double),
+                        ("largeValue", ctypes.c_longlong)]
+
+        class Fmt(ctypes.Structure):
+            _fields_ = [("CStatus", ctypes.c_uint32), ("v", Val)]
+
+        class Item(ctypes.Structure):
+            _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", Fmt)]
+
+        pdh = ctypes.windll.pdh
+        fmt_double = 0x200
+        size, count = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        status = pdh.PdhGetFormattedCounterArrayW(handle, fmt_double, ctypes.byref(size),
+                                                  ctypes.byref(count), None)
+        if (status & 0xFFFFFFFF) != 0x800007D2 or not size.value:  # PDH_MORE_DATA
+            return {}
+        buf = ctypes.create_string_buffer(size.value)
+        if pdh.PdhGetFormattedCounterArrayW(handle, fmt_double, ctypes.byref(size),
+                                            ctypes.byref(count), buf) != 0:
+            return {}
+        items = ctypes.cast(buf, ctypes.POINTER(Item))
+        out = {}
+        for i in range(count.value):
+            if items[i].FmtValue.CStatus in (0, 1):
+                out[items[i].szName] = items[i].FmtValue.v.doubleValue
+        return out
+
+    def read(self):
+        if not self.ok:
+            return None
+        try:
+            if self.query is None or self.polls >= self.REOPEN_AFTER:
+                self.close()
+                self._open()
+                self.polls = 0
+                return self.last
+            self.polls += 1
+            ctypes.windll.pdh.PdhCollectQueryData(self.query)
+            engine = self._array(self.handles["engine"])
+            mem = self._array(self.handles["mem"]) if "mem" in self.handles else {}
+            result = summarize_gpu(engine, mem, self.total)
+            if result:
+                self.last = result
+            return self.last
+        except Exception:
+            self.ok = False  # give up quietly; the row shows "unavailable"
+            self.close()
+            return None
+
+
 def set_startup(enable):
     try:
         import winreg
@@ -201,6 +357,7 @@ class App:
         self.alerts = {"cpu": False, "mem": False}
         self.last_beep, self.last_log = {}, 0
         self.gpu, self.gpu_t, self.freq = None, 0, None
+        self.gpu_counters = GpuCounters()
         self.read = self.write = self.down = self.up = 0.0
         self.ticks = 0
         self.sys_drive = (os.environ.get("SystemDrive", "C:") + "\\") if os.name == "nt" else "/"
@@ -406,7 +563,7 @@ class App:
             f = psutil.cpu_freq()
             self.freq = f.current if f else None
         if s["show_gpu"] and now - self.gpu_t >= 2:
-            self.gpu, self.gpu_t = read_gpu(), now
+            self.gpu, self.gpu_t = (read_gpu() or self.gpu_counters.read()), now
         if s["show_procs"] and self.ticks % 2 == 0:
             self.procs = self.scan_processes()
         self.ticks += 1
@@ -467,6 +624,7 @@ class App:
         if self.s["remember_pos"]:
             self.s["pos"] = [self.root.winfo_x(), self.root.winfo_y()]
         save_settings(self.s)
+        self.gpu_counters.close()
         self.root.destroy()
 
     # -- drawing primitives ----------------------------------------------
@@ -606,11 +764,12 @@ class App:
         if s["show_gpu"]:
             if self.gpu:
                 util, used, total, temp = self.gpu
-                tmp = f"{temp * 9 / 5 + 32:.0f}°F" if s["temp_unit"] == "F" else f"{temp:.0f}°C"
-                y = self.metric(y, "GPU", f"{util:.0f}%", util,
-                                f"{used / 1024:.1f} / {total / 1024:.1f} GB  ·  {tmp}")
+                parts = [f"{used / 1024:.1f} / {total / 1024:.1f} GB" if total else f"{used / 1024:.1f} GB"]
+                if temp is not None:
+                    parts.append(f"{temp * 9 / 5 + 32:.0f}°F" if s["temp_unit"] == "F" else f"{temp:.0f}°C")
+                y = self.metric(y, "GPU", f"{util:.0f}%", util, "  ·  ".join(parts))
             else:
-                y = self.line(y, "GPU", "not detected (NVIDIA only)")
+                y = self.line(y, "GPU", "waiting for data…" if self.gpu_counters.ok else "unavailable")
         if s["show_battery"]:
             b = psutil.sensors_battery()
             if b:
