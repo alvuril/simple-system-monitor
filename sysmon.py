@@ -25,7 +25,7 @@ try:  # crisp text on high-DPI screens
 except Exception:
     pass
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 FONT = "Segoe UI"
 W, SETTINGS_H, PAD = 360, 600, 28
 WARN, CRIT = "#f6c177", "#eb6f92"
@@ -164,7 +164,9 @@ MEM_RE = re.compile(r"luid_(0x[0-9a-f]+_0x[0-9a-f]+)", re.I)
 
 
 def summarize_gpu(engine, mem, total):
-    """Turn raw counter values into (load %, VRAM used MB, VRAM total MB or None, temp or None)."""
+    """Turn raw counter values into (load %, VRAM used MB, VRAM total MB or None, temp or None).
+
+    `total` is a number of bytes, or a function that takes the GPU's id and returns bytes."""
     busy = {}
     for name, val in engine.items():
         m = ENG_RE.search(name)
@@ -183,12 +185,55 @@ def summarize_gpu(engine, mem, total):
         return None
     pool = used or util  # main GPU = the one holding the most video memory
     main = max(pool, key=pool.get)
-    return (min(util.get(main, 0.0), 100.0), used.get(main, 0.0) / 1048576,
+    used_bytes = used.get(main, 0.0)
+    if callable(total):
+        total = total(main)
+    if total and total < used_bytes:  # the registry figure can't belong to this GPU
+        total = None
+    return (min(util.get(main, 0.0), 100.0), used_bytes / 1048576,
             total / 1048576 if total else None, None)
 
 
+def adapter_vram(luid):
+    """Exact dedicated video memory (bytes) of one GPU, found by its id."""
+    try:
+        from ctypes import c_uint32, c_int32, c_uint64, c_void_p
+        high, low = (int(x, 16) for x in luid.split("_"))
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", c_uint32), ("HighPart", c_int32)]
+
+        class OpenArgs(ctypes.Structure):
+            _fields_ = [("AdapterLuid", LUID), ("hAdapter", c_uint32)]
+
+        class QueryArgs(ctypes.Structure):
+            _fields_ = [("hAdapter", c_uint32), ("Type", c_uint32),
+                        ("pData", c_void_p), ("Size", c_uint32)]
+
+        class SegmentSizes(ctypes.Structure):
+            _fields_ = [("Dedicated", c_uint64), ("DedicatedSystem", c_uint64), ("Shared", c_uint64)]
+
+        class CloseArgs(ctypes.Structure):
+            _fields_ = [("hAdapter", c_uint32)]
+
+        gdi = ctypes.windll.gdi32
+        opened = OpenArgs(LUID(low, high - (1 << 32) if high >= (1 << 31) else high), 0)
+        if gdi.D3DKMTOpenAdapterFromLuid(ctypes.byref(opened)) != 0:
+            return None
+        try:
+            seg = SegmentSizes()
+            query = QueryArgs(opened.hAdapter, 3, ctypes.addressof(seg), ctypes.sizeof(seg))  # 3 = segment sizes
+            if gdi.D3DKMTQueryAdapterInfo(ctypes.byref(query)) != 0:
+                return None
+            return int(seg.Dedicated) or None
+        finally:
+            gdi.D3DKMTCloseAdapter(ctypes.byref(CloseArgs(opened.hAdapter)))
+    except Exception:
+        return None
+
+
 def vram_total():
-    """Total video memory if the PC has exactly one GPU entry in the registry."""
+    """Largest video memory size the registry lists for a display adapter."""
     try:
         import winreg
         base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
@@ -212,7 +257,7 @@ def vram_total():
                         sizes.append(int(val))
                 except OSError:
                     pass
-        return sizes[0] if len(sizes) == 1 else None
+        return max(sizes) if sizes else None
     except Exception:
         return None
 
@@ -226,7 +271,13 @@ class GpuCounters:
     def __init__(self):
         self.ok = os.name == "nt"
         self.query, self.handles, self.polls, self.last = None, {}, 0, None
-        self.total = vram_total() if self.ok else None
+        self.reg_total = vram_total() if self.ok else None  # fallback if the exact lookup fails
+        self.totals = {}
+
+    def total_for(self, luid):
+        if luid not in self.totals:
+            self.totals[luid] = adapter_vram(luid)
+        return self.totals[luid] or self.reg_total
 
     def _setup_api(self):
         from ctypes import POINTER, c_uint32, c_void_p, c_wchar_p, c_size_t
@@ -303,7 +354,7 @@ class GpuCounters:
             ctypes.windll.pdh.PdhCollectQueryData(self.query)
             engine = self._array(self.handles["engine"])
             mem = self._array(self.handles["mem"]) if "mem" in self.handles else {}
-            result = summarize_gpu(engine, mem, self.total)
+            result = summarize_gpu(engine, mem, self.total_for)
             if result:
                 self.last = result
             return self.last
@@ -764,7 +815,10 @@ class App:
         if s["show_gpu"]:
             if self.gpu:
                 util, used, total, temp = self.gpu
-                parts = [f"{used / 1024:.1f} / {total / 1024:.1f} GB" if total else f"{used / 1024:.1f} GB"]
+                if total:
+                    parts = [f"{used / 1024:.1f} out of {f'{total / 1024:.1f}'.rstrip('0').rstrip('.')} GB"]
+                else:
+                    parts = [f"{used / 1024:.1f} GB used"]
                 if temp is not None:
                     parts.append(f"{temp * 9 / 5 + 32:.0f}°F" if s["temp_unit"] == "F" else f"{temp:.0f}°C")
                 y = self.metric(y, "GPU", f"{util:.0f}%", util, "  ·  ".join(parts))
