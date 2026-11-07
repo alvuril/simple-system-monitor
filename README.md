@@ -2,8 +2,6 @@
 
 A clean, minimal system monitor for Windows. Everything is optional: turn features on and off in the built-in settings page.
 
-   ![System Monitor](demo.gif)
-
 ## Download
 
 1. Go to the [Releases](../../releases) page and download `SystemMonitor-windows.zip`.
@@ -23,7 +21,7 @@ certutil -hashfile SystemMonitor-windows.zip SHA256
 - Memory and swap / page file
 - Disk usage for any drive, plus disk read / write speed
 - Network download / upload speed (MB/s or Mbps) with optional graph
-- NVIDIA GPU load, VRAM and temperature (needs NVIDIA drivers)
+- GPU load and video memory for NVIDIA, AMD and Intel (NVIDIA cards also show temperature)
 - Battery level, charging state and time remaining
 - Uptime
 - Top processes by CPU or memory (type in how many to show)
