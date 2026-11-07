@@ -2,6 +2,8 @@
 
 A clean, minimal system monitor for Windows. Everything is optional: turn features on and off in the built-in settings page.
 
+   ![System Monitor](demo.gif)
+
 ## Download
 
 1. Go to the [Releases](../../releases) page and download `SystemMonitor-windows.zip`.
